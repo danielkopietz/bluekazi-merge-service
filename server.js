@@ -19,6 +19,9 @@
 // Response: application/pdf (binary)
 
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const { PDFDocument } = require("pdf-lib");
 const sharp = require("sharp");
 
@@ -26,6 +29,10 @@ const app = express();
 app.use(express.json({ limit: "80mb" }));
 
 const SHARED_TOKEN = process.env.MERGE_SERVICE_TOKEN || "";
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.PROFILE_RENDERER_BASE_URL || "").replace(/\/+$/, "");
+const TEMP_IMAGE_DIR = process.env.TEMP_IMAGE_DIR || path.join("/tmp", "bluekazi-profile-renderer-images");
+
+fs.mkdirSync(TEMP_IMAGE_DIR, { recursive: true });
 
 function isImageMime(mimeType) {
   return /^image\/(jpe?g|png|webp|gif|bmp|tiff?)$/i.test(mimeType || "");
@@ -33,6 +40,19 @@ function isImageMime(mimeType) {
 
 function isPdfMime(mimeType) {
   return mimeType === "application/pdf";
+}
+
+function ensureAuthorized(req) {
+  if (!SHARED_TOKEN) return true;
+  const provided = req.body?.token || req.query?.token || req.headers["x-merge-token"];
+  return provided === SHARED_TOKEN;
+}
+
+function getPublicBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${protocol}://${host}`;
 }
 
 async function imageBufferToPdfBytes(buffer) {
@@ -65,11 +85,8 @@ async function imageBufferToPdfBytes(buffer) {
 
 app.post("/merge", async (req, res) => {
   try {
-    if (SHARED_TOKEN) {
-      const provided = req.body?.token || req.headers["x-merge-token"];
-      if (provided !== SHARED_TOKEN) {
-        return res.status(401).json({ error: "Invalid or missing token" });
-      }
+    if (!ensureAuthorized(req)) {
+      return res.status(401).json({ error: "Invalid or missing token" });
     }
 
     const documents = Array.isArray(req.body?.documents) ? req.body.documents : [];
@@ -109,6 +126,69 @@ app.post("/merge", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Merge failed", details: String(err?.message || err) });
+  }
+});
+
+app.post("/publish-image", async (req, res) => {
+  try {
+    if (!ensureAuthorized(req)) {
+      return res.status(401).json({ error: "Invalid or missing token" });
+    }
+
+    const role = (req.body?.role || "image").toString();
+    const mimeType = (req.body?.mimeType || "image/png").toString();
+    const data = req.body?.data;
+    if (!data || !isImageMime(mimeType)) {
+      return res.status(400).json({ error: "A supported image mimeType and base64 data are required" });
+    }
+
+    const sourceBuffer = Buffer.from(data, "base64");
+    const normalizedBuffer = await sharp(sourceBuffer).rotate().png().toBuffer();
+    const tempImageId = crypto.randomUUID();
+    const fileName = `${tempImageId}.png`;
+    const filePath = path.join(TEMP_IMAGE_DIR, fileName);
+    fs.writeFileSync(filePath, normalizedBuffer);
+
+    const publicBaseUrl = getPublicBaseUrl(req).replace(/\/+$/, "");
+    res.json({
+      ok: true,
+      role,
+      tempImageId,
+      mimeType: "image/png",
+      publicUrl: `${publicBaseUrl}/temp-images/${fileName}`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Image publish failed", details: String(err?.message || err) });
+  }
+});
+
+app.get("/temp-images/:fileName", (req, res) => {
+  const fileName = path.basename(req.params.fileName || "");
+  const filePath = path.join(TEMP_IMAGE_DIR, fileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Image not found" });
+  }
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.sendFile(filePath);
+});
+
+app.delete("/publish-image/:tempImageId", (req, res) => {
+  try {
+    if (!ensureAuthorized(req)) {
+      return res.status(401).json({ error: "Invalid or missing token" });
+    }
+    const tempImageId = path.basename(req.params.tempImageId || "");
+    if (!tempImageId) {
+      return res.status(400).json({ error: "tempImageId is required" });
+    }
+    const filePath = path.join(TEMP_IMAGE_DIR, `${tempImageId}.png`);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.json({ ok: true, tempImageId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Image cleanup failed", details: String(err?.message || err) });
   }
 });
 
