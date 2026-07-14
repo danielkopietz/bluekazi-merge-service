@@ -154,7 +154,8 @@ async function rasterizePdfToPngBuffers(pdfBuffer, requestId) {
 }
 
 async function loadDocumentPageImages(doc, requestId) {
-  const buffer = Buffer.from(doc.data, "base64");
+  const label = doc.fileName || doc.name || "source document";
+  const { buffer } = decodeBase64ToBuffer(doc.data, label);
   if (isPdfMime(doc.mimeType)) return rasterizePdfToPngBuffers(buffer, requestId);
   if (isImageMime(doc.mimeType)) return [await normalizeImageToPngBuffer(buffer)];
   return [];
@@ -574,14 +575,24 @@ app.post("/profile-pdf", async (req, res) => {
         .filter(Boolean)
     );
 
+    if (!documents.length) {
+      return res.status(422).json({ error: "At least one source document is required for the final profile PDF" });
+    }
+
     let idPreviewPngBuffer = null;
     const documentPageArrays = [];
+    const documentErrors = [];
     for (const doc of documents) {
-      if (!doc?.data) continue;
+      if (!doc?.data) {
+        documentErrors.push(`${doc?.fileName || doc?.name || "Unnamed document"}: missing base64 data`);
+        continue;
+      }
       try {
         const pages = await documentToRedactedPdfPages(doc, requestId);
         if (!pages.length) {
           logWithRequestId(requestId, `Document "${doc.fileName || doc.name}" produced 0 pages (unsupported/undecodable data?)`);
+          documentErrors.push(`${doc.fileName || doc.name}: produced 0 pages`);
+          continue;
         }
         documentPageArrays.push(...pages);
         if (!idPreviewPngBuffer && identityFileNames.has(doc.fileName)) {
@@ -598,8 +609,18 @@ app.post("/profile-pdf", async (req, res) => {
           }
         }
       } catch (docErr) {
-        logWithRequestId(requestId, `Failed to process document "${doc.fileName || doc.name}", skipping`, String(docErr?.message || docErr));
+        const detail = String(docErr?.message || docErr);
+        logWithRequestId(requestId, `Failed to process document "${doc.fileName || doc.name}"`, detail);
+        documentErrors.push(`${doc.fileName || doc.name}: ${detail}`);
       }
+    }
+
+    if (documentErrors.length || !documentPageArrays.length) {
+      return res.status(422).json({
+        error: "Source document rendering failed",
+        details: documentErrors,
+        renderedSourcePages: documentPageArrays.length,
+      });
     }
 
     const candidatePhotoPngBuffer = await resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId);
