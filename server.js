@@ -284,7 +284,7 @@ function wrapTextLines(text, font, fontSize, maxWidth) {
   return lines;
 }
 
-async function renderProfilePdf(profile, candidatePhotoPngBuffer) {
+async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBuffer) {
   const doc = await PDFDocument.create();
   const fontRegular = await doc.embedFont(StandardFonts.Helvetica);
   const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
@@ -344,33 +344,12 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer) {
     y -= size + gapAfter - 4;
   };
 
-  // ===================== COVER HEADER (logo + optional photo) =====================
+  // ===================== COVER HEADER (title left, logo top-right) =====================
   const logoW = 150;
   const logoH = logoW * logoAspect;
-  page.drawImage(logoImage, { x: PAGE_MARGIN, y: y - logoH, width: logoW, height: logoH });
-
-  const photoBoxSize = 92;
-  if (candidatePhotoImage) {
-    const cw = candidatePhotoImage.width;
-    const ch = candidatePhotoImage.height;
-    const scale = Math.min(photoBoxSize / cw, photoBoxSize / ch);
-    const drawW = cw * scale;
-    const drawH = ch * scale;
-    const photoX = A4_W - PAGE_MARGIN - photoBoxSize;
-    const photoY = y - photoBoxSize;
-    page.drawRectangle({ x: photoX, y: photoY, width: photoBoxSize, height: photoBoxSize, borderColor: BRAND_NAVY, borderWidth: 1.5, color: rgb(0.95, 0.96, 0.98) });
-    page.drawImage(candidatePhotoImage, {
-      x: photoX + (photoBoxSize - drawW) / 2,
-      y: photoY + (photoBoxSize - drawH) / 2,
-      width: drawW,
-      height: drawH,
-    });
-  }
-
-  y -= Math.max(logoH, candidatePhotoImage ? photoBoxSize : 0) + 18;
-
-  page.drawText("Candidate Profile", { x: PAGE_MARGIN, y, size: 20, font: fontBold, color: TEXT_DARK });
-  y -= 30;
+  page.drawImage(logoImage, { x: A4_W - PAGE_MARGIN - logoW, y: y - logoH, width: logoW, height: logoH });
+  page.drawText("Candidate Profile", { x: PAGE_MARGIN, y: y - logoH / 2 - 7, size: 20, font: fontBold, color: TEXT_DARK });
+  y -= logoH + 18;
 
   // ===================== CORE FIELD TABLE =====================
   const c = profile.candidate || {};
@@ -395,7 +374,43 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer) {
       y -= 14;
     }
   }
-  y -= 6;
+  y -= 10;
+
+  // ===================== THUMBNAIL ROW (candidate photo + ID preview) =====================
+  let idPreviewImage = null;
+  if (idPreviewPngBuffer) {
+    try {
+      idPreviewImage = await doc.embedPng(idPreviewPngBuffer);
+    } catch (e) {
+      idPreviewImage = null;
+    }
+  }
+  if (candidatePhotoImage || idPreviewImage) {
+    const thumbH = 110;
+    const idThumbW = 170;
+    ensureSpace(thumbH + 10);
+    let cursorX = PAGE_MARGIN;
+    if (idPreviewImage) {
+      const iw = idPreviewImage.width;
+      const ih = idPreviewImage.height;
+      const scale = Math.min(idThumbW / iw, thumbH / ih);
+      const drawW = iw * scale;
+      const drawH = ih * scale;
+      page.drawRectangle({ x: cursorX, y: y - thumbH, width: idThumbW, height: thumbH, borderColor: BRAND_NAVY, borderWidth: 1, color: rgb(0.97, 0.97, 0.98) });
+      page.drawImage(idPreviewImage, { x: cursorX + (idThumbW - drawW) / 2, y: y - thumbH + (thumbH - drawH) / 2, width: drawW, height: drawH });
+      cursorX += idThumbW + 16;
+    }
+    if (candidatePhotoImage) {
+      const cw = candidatePhotoImage.width;
+      const ch = candidatePhotoImage.height;
+      const scale = Math.min(thumbH / cw, thumbH / ch);
+      const drawW = cw * scale;
+      const drawH = ch * scale;
+      page.drawRectangle({ x: cursorX, y: y - thumbH, width: thumbH, height: thumbH, borderColor: BRAND_NAVY, borderWidth: 1, color: rgb(0.97, 0.97, 0.98) });
+      page.drawImage(candidatePhotoImage, { x: cursorX + (thumbH - drawW) / 2, y: y - thumbH + (thumbH - drawH) / 2, width: drawW, height: drawH });
+    }
+    y -= thumbH + 14;
+  }
 
   if (profile.headline) {
     drawParagraph(profile.headline, { size: 11.5, font: fontItalic, color: TEXT_MUTED, gap: 10 });
@@ -527,6 +542,21 @@ app.post("/profile-pdf", async (req, res) => {
     const documents = Array.isArray(req.body?.documents) ? req.body.documents : [];
     const candidatePhoto = req.body?.candidatePhoto || null;
 
+    // Diagnostics: log exactly what each document's data field looks like BEFORE
+    // trying to decode it, so a bad payload (e.g. a placeholder string instead of
+    // real base64) shows up clearly in the logs instead of silently vanishing.
+    for (const doc of documents) {
+      const dataPreview = typeof doc?.data === "string" ? doc.data.slice(0, 24) : typeof doc?.data;
+      const looksLikeBase64 = typeof doc?.data === "string" && /^[A-Za-z0-9+/=]+$/.test(doc.data.replace(/\s+/g, "").slice(0, 200));
+      logWithRequestId(requestId, `Incoming document "${doc?.fileName || doc?.name}"`, {
+        mimeType: doc?.mimeType,
+        dataType: typeof doc?.data,
+        dataLength: typeof doc?.data === "string" ? doc.data.length : null,
+        dataPreview,
+        looksLikeBase64,
+      });
+    }
+
     logWithRequestId(requestId, "Rendering profile page", {
       displayName: profile.display_name,
       pdfLanguage,
@@ -534,22 +564,50 @@ app.post("/profile-pdf", async (req, res) => {
       hasCandidatePhoto: Boolean(candidatePhoto),
     });
 
-    const candidatePhotoPngBuffer = await resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId);
-    const profilePdfBytes = await renderProfilePdf(profile, candidatePhotoPngBuffer);
-    const pdfByteArrays = [profilePdfBytes];
+    // Process source documents FIRST (redaction + rasterization), so we can also
+    // pull out a small preview of the identity document for the cover page.
+    const identityKindPattern = /passport|id[_ ]?number|resident|driving[_ ]?license|identity/i;
+    const identityFileNames = new Set(
+      (profile.documents || [])
+        .filter((d) => identityKindPattern.test(`${d.document_type || ""} ${d.document_kind || ""}`))
+        .map((d) => d.file_name)
+        .filter(Boolean)
+    );
 
+    let idPreviewPngBuffer = null;
+    const documentPageArrays = [];
     for (const doc of documents) {
       if (!doc?.data) continue;
       try {
         const pages = await documentToRedactedPdfPages(doc, requestId);
-        pdfByteArrays.push(...pages);
+        if (!pages.length) {
+          logWithRequestId(requestId, `Document "${doc.fileName || doc.name}" produced 0 pages (unsupported/undecodable data?)`);
+        }
+        documentPageArrays.push(...pages);
+        if (!idPreviewPngBuffer && identityFileNames.has(doc.fileName)) {
+          try {
+            const rawImages = await loadDocumentPageImages(doc, requestId);
+            if (rawImages[0]) {
+              const boxesForFirstPage = (Array.isArray(doc.redactionBoxes) ? doc.redactionBoxes : []).filter(
+                (b) => !Number.isInteger(b?.page) || b.page === 1
+              );
+              idPreviewPngBuffer = await applyRedactionBoxes(rawImages[0], boxesForFirstPage);
+            }
+          } catch (previewErr) {
+            logWithRequestId(requestId, "Could not build ID preview thumbnail", String(previewErr?.message || previewErr));
+          }
+        }
       } catch (docErr) {
         logWithRequestId(requestId, `Failed to process document "${doc.fileName || doc.name}", skipping`, String(docErr?.message || docErr));
       }
     }
 
+    const candidatePhotoPngBuffer = await resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId);
+    const profilePdfBytes = await renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBuffer);
+    const pdfByteArrays = [profilePdfBytes, ...documentPageArrays];
+
     const mergedBytes = await mergePdfByteArrays(pdfByteArrays);
-    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} blob(s) merged`);
+    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} blob(s) merged (${documentPageArrays.length} source document page(s))`);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="${req.body?.output?.fileName || "profile.pdf"}"`);
