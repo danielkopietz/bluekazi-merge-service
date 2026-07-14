@@ -1,27 +1,26 @@
 // Bluekazi Profile Merge Service
 //
-// Two capabilities:
+// Capabilities:
 //
 // 1) POST /merge — legacy endpoint. Merges given documents (PDFs/images, in order)
-//    into one PDF. Unchanged from before.
+//    into one PDF. Unchanged.
 //
-// 2) POST /profile-pdf — NEW. Renders a candidate profile (profile_de / profile_en
-//    JSON, produced by n8n/OpenAI) into a formatted PDF page, then appends the
-//    candidate's original source documents (rasterized page-by-page, with targeted
-//    black-box redactions applied at coordinates n8n already computed), producing
-//    ONE final PDF: [profile page(s)] + [document 1 pages] + [document 2 pages] + ...
+// 2) POST /profile-pdf — renders a full branded candidate profile:
+//      [branded cover + profile pages] + [document 1 pages] + [document 2 pages] + ...
+//    - Cover page: Bluekazi logo, candidate photo (if available), core fields
+//    - Profile pages: headline, highlights, experience, education, skills,
+//      document status, manual review notes
+//    - Source documents: rasterized page-by-page, with targeted black-box
+//      redactions applied at coordinates n8n already computed via Vision
 //
 // This service has NO Google Drive or OpenAI credentials of its own. n8n does all
-// downloading and all "where are the sensitive numbers" detection (via OpenAI
-// Vision) and just sends this service base64 documents + redaction box coordinates.
-// This service only renders/rasterizes/draws boxes/merges — it does not "look at"
-// or interpret document content.
+// downloading and all "where are the sensitive numbers / where is the candidate's
+// face" detection (via OpenAI Vision) and just sends this service base64
+// documents + box coordinates. This service only renders/rasterizes/crops/draws
+// boxes/merges — it does not itself interpret document content.
 //
-// Redaction box coordinates are FRACTIONS (0..1) of the page's/image's own width
-// and height, 1-indexed "page" referring to the position within that single
-// document (most source docs are 1 page). Example:
-//   { "page": 1, "x": 0.62, "y": 0.81, "width": 0.30, "height": 0.05 }
-// means: a box starting at 62% across / 81% down the page, 30% wide, 5% tall.
+// Box coordinates (redactionBoxes, candidatePhoto.cropBox) are FRACTIONS (0..1)
+// of that page's own width/height, "page" is 1-indexed within that document.
 
 const express = require("express");
 const fs = require("fs");
@@ -32,6 +31,7 @@ const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const sharp = require("sharp");
+const { BLUEKAZI_LOGO_PNG_BASE64 } = require("./assets/logo");
 
 const execFileAsync = promisify(execFile);
 
@@ -49,37 +49,26 @@ fs.mkdirSync(TEMP_IMAGE_DIR, { recursive: true });
 function isImageMime(mimeType) {
   return /^image\/(jpe?g|png|webp|gif|bmp|tiff?)$/i.test(mimeType || "");
 }
-
 function isPdfMime(mimeType) {
   return mimeType === "application/pdf";
 }
-
 function ensureAuthorized(req) {
   if (!SHARED_TOKEN) return true;
   const provided = req.body?.token || req.query?.token || req.headers["x-merge-token"];
   return provided === SHARED_TOKEN;
 }
-
 function createRequestId() {
   return crypto.randomBytes(6).toString("hex");
 }
-
 function logWithRequestId(requestId, message, extra = undefined) {
-  if (extra === undefined) {
-    console.log(`[${requestId}] ${message}`);
-    return;
-  }
-  console.log(`[${requestId}] ${message}`, extra);
+  if (extra === undefined) console.log(`[${requestId}] ${message}`);
+  else console.log(`[${requestId}] ${message}`, extra);
 }
 
 function normalizeBase64String(input) {
-  if (typeof input !== "string") {
-    throw new Error("Expected base64 data as a string");
-  }
+  if (typeof input !== "string") throw new Error("Expected base64 data as a string");
   const trimmed = input.trim();
-  if (!trimmed) {
-    throw new Error("Base64 data is empty");
-  }
+  if (!trimmed) throw new Error("Base64 data is empty");
   const dataUriMatch = trimmed.match(/^data:([^;,]+)?(;base64)?,(.*)$/is);
   let mimeTypeFromDataUri = null;
   let payload = trimmed;
@@ -89,36 +78,24 @@ function normalizeBase64String(input) {
   }
   payload = payload.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
   const remainder = payload.length % 4;
-  if (remainder) {
-    payload += "=".repeat(4 - remainder);
-  }
-  if (!/^[A-Za-z0-9+/=]+$/.test(payload)) {
-    throw new Error("Base64 data contains unsupported characters");
-  }
+  if (remainder) payload += "=".repeat(4 - remainder);
+  if (!/^[A-Za-z0-9+/=]+$/.test(payload)) throw new Error("Base64 data contains unsupported characters");
   return { payload, mimeTypeFromDataUri };
 }
 
 function decodeBase64ToBuffer(input, label = "payload") {
   const { payload, mimeTypeFromDataUri } = normalizeBase64String(input);
   const buffer = Buffer.from(payload, "base64");
-  if (!buffer.length) {
-    throw new Error(`${label} decoded to an empty buffer`);
-  }
+  if (!buffer.length) throw new Error(`${label} decoded to an empty buffer`);
   return { buffer, mimeTypeFromDataUri, normalizedLength: payload.length };
 }
 
 async function normalizeImageToPngBuffer(inputBuffer) {
-  if (!Buffer.isBuffer(inputBuffer) || !inputBuffer.length) {
-    throw new Error("Image buffer is empty");
-  }
-  if (inputBuffer.length > MAX_IMAGE_BYTES) {
-    throw new Error(`Image buffer exceeds MAX_IMAGE_BYTES (${MAX_IMAGE_BYTES})`);
-  }
+  if (!Buffer.isBuffer(inputBuffer) || !inputBuffer.length) throw new Error("Image buffer is empty");
+  if (inputBuffer.length > MAX_IMAGE_BYTES) throw new Error(`Image buffer exceeds MAX_IMAGE_BYTES (${MAX_IMAGE_BYTES})`);
   const image = sharp(inputBuffer, { failOnError: true, animated: false });
   const metadata = await image.metadata();
-  if (!metadata?.width || !metadata?.height) {
-    throw new Error("Image metadata is incomplete");
-  }
+  if (!metadata?.width || !metadata?.height) throw new Error("Image metadata is incomplete");
   return image.rotate().png().toBuffer();
 }
 
@@ -129,10 +106,13 @@ function getPublicBaseUrl(req) {
   return `${protocol}://${host}`;
 }
 
-// A4 in PDF points
 const A4_W = 595.28;
 const A4_H = 841.89;
 const PAGE_MARGIN = 40;
+const BRAND_NAVY = rgb(0.09, 0.2, 0.45);
+const BRAND_NAVY_DARK = rgb(0.06, 0.14, 0.32);
+const TEXT_DARK = rgb(0.13, 0.13, 0.15);
+const TEXT_MUTED = rgb(0.4, 0.4, 0.43);
 
 async function imageBufferToPdfBytes(pngBuffer) {
   const doc = await PDFDocument.create();
@@ -144,18 +124,12 @@ async function imageBufferToPdfBytes(pngBuffer) {
   const drawW = width * scale;
   const drawH = height * scale;
   const page = doc.addPage([A4_W, A4_H]);
-  page.drawImage(png, {
-    x: (A4_W - drawW) / 2,
-    y: (A4_H - drawH) / 2,
-    width: drawW,
-    height: drawH,
-  });
+  page.drawImage(png, { x: (A4_W - drawW) / 2, y: (A4_H - drawH) / 2, width: drawW, height: drawH });
   return doc.save();
 }
 
 // ---------------------------------------------------------------------------
-// PDF -> page images, via poppler's pdftoppm (system binary, no native Node
-// build deps — see nixpacks.toml which installs poppler-utils).
+// PDF -> page images, via poppler's pdftoppm (system binary; see nixpacks.toml)
 // ---------------------------------------------------------------------------
 async function rasterizePdfToPngBuffers(pdfBuffer, requestId) {
   const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "bluekazi-raster-"));
@@ -169,13 +143,9 @@ async function rasterizePdfToPngBuffers(pdfBuffer, requestId) {
     const files = (await fs.promises.readdir(workDir))
       .filter((name) => name.startsWith("page") && name.endsWith(".png"))
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    if (!files.length) {
-      throw new Error("pdftoppm produced no page images");
-    }
+    if (!files.length) throw new Error("pdftoppm produced no page images");
     const buffers = [];
-    for (const file of files) {
-      buffers.push(await fs.promises.readFile(path.join(workDir, file)));
-    }
+    for (const file of files) buffers.push(await fs.promises.readFile(path.join(workDir, file)));
     logWithRequestId(requestId, `Rasterized PDF into ${buffers.length} page image(s)`);
     return buffers;
   } finally {
@@ -183,9 +153,15 @@ async function rasterizePdfToPngBuffers(pdfBuffer, requestId) {
   }
 }
 
+async function loadDocumentPageImages(doc, requestId) {
+  const buffer = Buffer.from(doc.data, "base64");
+  if (isPdfMime(doc.mimeType)) return rasterizePdfToPngBuffers(buffer, requestId);
+  if (isImageMime(doc.mimeType)) return [await normalizeImageToPngBuffer(buffer)];
+  return [];
+}
+
 // ---------------------------------------------------------------------------
-// Apply black-box redactions to a single page image. Boxes are fractions
-// (0..1) of that image's own width/height.
+// Black-box redaction. Boxes are fractions (0..1) of the image's own size.
 // ---------------------------------------------------------------------------
 async function applyRedactionBoxes(pngBuffer, boxes) {
   if (!Array.isArray(boxes) || !boxes.length) return pngBuffer;
@@ -208,23 +184,14 @@ async function applyRedactionBoxes(pngBuffer, boxes) {
     const pxY = Math.round(by * height);
     const rect = await sharp({
       create: { width: pxW, height: pxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 1 } },
-    })
-      .png()
-      .toBuffer();
+    }).png().toBuffer();
     overlays.push({ input: rect, left: pxX, top: pxY });
   }
   if (!overlays.length) return pngBuffer;
   return image.composite(overlays).png().toBuffer();
 }
 
-// ---------------------------------------------------------------------------
-// Redact + convert one source document (PDF or image) into an array of
-// finished PDF page byte-blobs (each single-page), respecting per-page
-// redaction boxes. "page" in redactionBoxes is 1-indexed; boxes without an
-// explicit page apply to page 1.
-// ---------------------------------------------------------------------------
 async function documentToRedactedPdfPages(doc, requestId) {
-  const buffer = Buffer.from(doc.data, "base64");
   const redactionBoxes = Array.isArray(doc.redactionBoxes) ? doc.redactionBoxes : [];
   const boxesByPage = new Map();
   for (const box of redactionBoxes) {
@@ -234,11 +201,13 @@ async function documentToRedactedPdfPages(doc, requestId) {
   }
 
   let pageImages;
-  if (isPdfMime(doc.mimeType)) {
-    pageImages = await rasterizePdfToPngBuffers(buffer, requestId);
-  } else if (isImageMime(doc.mimeType)) {
-    pageImages = [await normalizeImageToPngBuffer(buffer)];
-  } else {
+  try {
+    pageImages = await loadDocumentPageImages(doc, requestId);
+  } catch (err) {
+    logWithRequestId(requestId, `Could not load "${doc.fileName || doc.name}": ${String(err?.message || err)}`);
+    return [];
+  }
+  if (!pageImages.length) {
     logWithRequestId(requestId, `Skipping unsupported mimeType "${doc.mimeType}" for "${doc.fileName || doc.name}"`);
     return [];
   }
@@ -254,7 +223,49 @@ async function documentToRedactedPdfPages(doc, requestId) {
 }
 
 // ---------------------------------------------------------------------------
-// Profile JSON -> formatted PDF page(s), via pdf-lib text layout.
+// Candidate photo resolution: either a standalone provided photo, or a crop
+// out of one of the source documents' pages (e.g. a headshot embedded in the
+// CV), using the same fraction-coordinate convention as redaction boxes.
+// ---------------------------------------------------------------------------
+async function resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId) {
+  if (!candidatePhoto) return null;
+  try {
+    if (candidatePhoto.mode === "standalone" && candidatePhoto.data) {
+      const { buffer } = decodeBase64ToBuffer(candidatePhoto.data, "candidatePhoto");
+      return await normalizeImageToPngBuffer(buffer);
+    }
+    if (candidatePhoto.mode === "crop" && candidatePhoto.sourceDriveFileId && candidatePhoto.cropBox) {
+      const sourceDoc = (documents || []).find((d) => d.driveFileId === candidatePhoto.sourceDriveFileId);
+      if (!sourceDoc) {
+        logWithRequestId(requestId, `candidatePhoto.sourceDriveFileId "${candidatePhoto.sourceDriveFileId}" not found in documents[]`);
+        return null;
+      }
+      const pageImages = await loadDocumentPageImages(sourceDoc, requestId);
+      const pageIndex = Math.max(0, (candidatePhoto.cropBox.page || 1) - 1);
+      const pageImage = pageImages[pageIndex];
+      if (!pageImage) return null;
+      const meta = await sharp(pageImage).metadata();
+      const w = meta.width || 0;
+      const h = meta.height || 0;
+      if (!w || !h) return null;
+      const bx = Math.max(0, Math.min(1, candidatePhoto.cropBox.x || 0));
+      const by = Math.max(0, Math.min(1, candidatePhoto.cropBox.y || 0));
+      const bw = Math.max(0.01, Math.min(1 - bx, candidatePhoto.cropBox.width || 0));
+      const bh = Math.max(0.01, Math.min(1 - by, candidatePhoto.cropBox.height || 0));
+      const left = Math.round(bx * w);
+      const top = Math.round(by * h);
+      const width = Math.max(1, Math.round(bw * w));
+      const height = Math.max(1, Math.round(bh * h));
+      return await sharp(pageImage).extract({ left, top, width, height }).png().toBuffer();
+    }
+  } catch (err) {
+    logWithRequestId(requestId, "Candidate photo resolution failed, continuing without photo", String(err?.message || err));
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Profile JSON -> formatted, branded PDF page(s).
 // ---------------------------------------------------------------------------
 function wrapTextLines(text, font, fontSize, maxWidth) {
   const words = String(text || "").split(/\s+/).filter(Boolean);
@@ -273,16 +284,26 @@ function wrapTextLines(text, font, fontSize, maxWidth) {
   return lines;
 }
 
-async function renderProfilePdf(profile) {
+async function renderProfilePdf(profile, candidatePhotoPngBuffer) {
   const doc = await PDFDocument.create();
   const fontRegular = await doc.embedFont(StandardFonts.Helvetica);
   const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const fontItalic = await doc.embedFont(StandardFonts.HelveticaOblique);
+
+  const logoBytes = Buffer.from(BLUEKAZI_LOGO_PNG_BASE64, "base64");
+  const logoImage = await doc.embedPng(logoBytes);
+  const logoAspect = logoImage.height / logoImage.width;
+
+  let candidatePhotoImage = null;
+  if (candidatePhotoPngBuffer) {
+    try {
+      candidatePhotoImage = await doc.embedPng(candidatePhotoPngBuffer);
+    } catch (e) {
+      candidatePhotoImage = null;
+    }
+  }
 
   const maxWidth = A4_W - PAGE_MARGIN * 2;
-  const colorDark = rgb(0.13, 0.13, 0.15);
-  const colorMuted = rgb(0.38, 0.38, 0.4);
-  const colorAccent = rgb(0.02, 0.29, 0.55);
-
   let page = doc.addPage([A4_W, A4_H]);
   let y = A4_H - PAGE_MARGIN;
 
@@ -293,19 +314,19 @@ async function renderProfilePdf(profile) {
     }
   };
 
-  const drawParagraph = (text, { size = 10.5, font = fontRegular, color = colorDark, gap = 6, lineHeight = 1.35 } = {}) => {
-    const lines = wrapTextLines(text, font, size, maxWidth);
+  const drawParagraph = (text, { size = 10.5, font = fontRegular, color = TEXT_DARK, gap = 6, lineHeight = 1.35, width = maxWidth, x = PAGE_MARGIN } = {}) => {
+    const lines = wrapTextLines(text, font, size, width);
     for (const line of lines) {
       ensureSpace(size * lineHeight);
-      page.drawText(line, { x: PAGE_MARGIN, y, size, font, color });
+      page.drawText(line, { x, y, size, font, color });
       y -= size * lineHeight;
     }
     y -= gap;
   };
 
-  const drawBullet = (text, { size = 10, font = fontRegular, color = colorDark } = {}) => {
+  const drawBullet = (text, { size = 10, font = fontRegular, color = TEXT_DARK, width = maxWidth } = {}) => {
     const bulletIndent = 14;
-    const lines = wrapTextLines(text, font, size, maxWidth - bulletIndent);
+    const lines = wrapTextLines(text, font, size, width - bulletIndent);
     lines.forEach((line, index) => {
       ensureSpace(size * 1.35);
       const prefix = index === 0 ? "\u2022 " : "  ";
@@ -314,98 +335,140 @@ async function renderProfilePdf(profile) {
     });
   };
 
-  const drawHeading = (text, { size = 13, gapBefore = 14, gapAfter = 6 } = {}) => {
-    ensureSpace(size + gapBefore);
+  const drawHeading = (text, { size = 13, gapBefore = 16, gapAfter = 8 } = {}) => {
+    ensureSpace(size + gapBefore + 6);
     y -= gapBefore;
-    page.drawText(text, { x: PAGE_MARGIN, y, size, font: fontBold, color: colorAccent });
-    y -= size + gapAfter;
+    page.drawText(text.toUpperCase(), { x: PAGE_MARGIN, y, size, font: fontBold, color: BRAND_NAVY });
+    y -= 4;
+    page.drawLine({ start: { x: PAGE_MARGIN, y }, end: { x: A4_W - PAGE_MARGIN, y }, thickness: 1.2, color: BRAND_NAVY });
+    y -= size + gapAfter - 4;
   };
 
-  // --- Header ---
-  ensureSpace(30);
-  page.drawText(profile.display_name || "", { x: PAGE_MARGIN, y, size: 20, font: fontBold, color: colorDark });
-  y -= 26;
-  if (profile.headline) {
-    drawParagraph(profile.headline, { size: 12, font: fontRegular, color: colorMuted, gap: 10 });
+  // ===================== COVER HEADER (logo + optional photo) =====================
+  const logoW = 150;
+  const logoH = logoW * logoAspect;
+  page.drawImage(logoImage, { x: PAGE_MARGIN, y: y - logoH, width: logoW, height: logoH });
+
+  const photoBoxSize = 92;
+  if (candidatePhotoImage) {
+    const cw = candidatePhotoImage.width;
+    const ch = candidatePhotoImage.height;
+    const scale = Math.min(photoBoxSize / cw, photoBoxSize / ch);
+    const drawW = cw * scale;
+    const drawH = ch * scale;
+    const photoX = A4_W - PAGE_MARGIN - photoBoxSize;
+    const photoY = y - photoBoxSize;
+    page.drawRectangle({ x: photoX, y: photoY, width: photoBoxSize, height: photoBoxSize, borderColor: BRAND_NAVY, borderWidth: 1.5, color: rgb(0.95, 0.96, 0.98) });
+    page.drawImage(candidatePhotoImage, {
+      x: photoX + (photoBoxSize - drawW) / 2,
+      y: photoY + (photoBoxSize - drawH) / 2,
+      width: drawW,
+      height: drawH,
+    });
   }
 
-  // --- Candidate facts ---
-  const c = profile.candidate || {};
-  const factLine = [c.target_role, c.nationality, c.country_of_residence].filter(Boolean).join("  \u2022  ");
-  if (factLine) drawParagraph(factLine, { size: 10.5, color: colorMuted, gap: 4 });
-  if (c.driving_license) drawParagraph(`Driving license: ${c.driving_license}`, { size: 10.5, color: colorMuted, gap: 10 });
+  y -= Math.max(logoH, candidatePhotoImage ? photoBoxSize : 0) + 18;
 
-  // --- Top facts ---
+  page.drawText("Candidate Profile", { x: PAGE_MARGIN, y, size: 20, font: fontBold, color: TEXT_DARK });
+  y -= 30;
+
+  // ===================== CORE FIELD TABLE =====================
+  const c = profile.candidate || {};
+  const fieldRows = [
+    ["Name", profile.display_name || c.full_name || ""],
+    ["Date of Birth", c.date_of_birth || ""],
+    ["Position", c.target_role || ""],
+    ["Nationality", c.nationality || ""],
+    ["Country of Residence", c.country_of_residence || ""],
+    ["Education", c.education_topline || ""],
+  ].filter(([, value]) => value);
+
+  for (const [label, value] of fieldRows) {
+    ensureSpace(16);
+    page.drawText(`${label}:`, { x: PAGE_MARGIN, y, size: 10.5, font: fontBold, color: BRAND_NAVY_DARK });
+    const lines = wrapTextLines(value, fontRegular, 10.5, maxWidth - 150);
+    page.drawText(lines[0] || "", { x: PAGE_MARGIN + 150, y, size: 10.5, font: fontRegular, color: TEXT_DARK });
+    y -= 16;
+    for (const extra of lines.slice(1)) {
+      ensureSpace(14);
+      page.drawText(extra, { x: PAGE_MARGIN + 150, y, size: 10.5, font: fontRegular, color: TEXT_DARK });
+      y -= 14;
+    }
+  }
+  y -= 6;
+
+  if (profile.headline) {
+    drawParagraph(profile.headline, { size: 11.5, font: fontItalic, color: TEXT_MUTED, gap: 10 });
+  }
+
+  // ===================== HIGHLIGHTS =====================
   const topFacts = (profile.top_facts || []).filter((f) => f?.public_visible !== false || f?.logged_in_visible !== false);
   if (topFacts.length) {
     drawHeading("Highlights");
-    for (const fact of topFacts) {
-      drawBullet(`${fact.label}: ${fact.value}`);
-    }
+    for (const fact of topFacts) drawBullet(`${fact.label}: ${fact.value}`);
     y -= 4;
   }
 
-  // --- Sections (summary, languages, etc.) ---
+  // ===================== SECTIONS (summary, languages, etc.) =====================
   for (const section of profile.sections || []) {
     drawHeading(section.title || "");
-    for (const para of section.paragraphs || []) {
-      drawParagraph(para);
-    }
-    for (const bullet of section.bullets || []) {
-      drawBullet(bullet);
-    }
+    for (const para of section.paragraphs || []) drawParagraph(para);
+    for (const bullet of section.bullets || []) drawBullet(bullet);
   }
 
-  // --- Professional experience ---
+  // ===================== PROFESSIONAL EXPERIENCE =====================
   if ((profile.professional_experience || []).length) {
     drawHeading("Professional Experience");
     for (const role of profile.professional_experience) {
       ensureSpace(14);
       const titleLine = [role.role, role.organization].filter(Boolean).join(" \u2014 ");
-      page.drawText(titleLine, { x: PAGE_MARGIN, y, size: 11, font: fontBold, color: colorDark });
+      page.drawText(titleLine, { x: PAGE_MARGIN, y, size: 11, font: fontBold, color: TEXT_DARK });
       y -= 14;
       const subLine = [role.location, role.period].filter(Boolean).join("  \u2022  ");
-      if (subLine) {
-        drawParagraph(subLine, { size: 9.5, color: colorMuted, gap: 4 });
-      }
-      for (const bullet of role.bullets || []) {
-        drawBullet(bullet, { size: 9.5 });
-      }
+      if (subLine) drawParagraph(subLine, { size: 9.5, color: TEXT_MUTED, gap: 4 });
+      for (const bullet of role.bullets || []) drawBullet(bullet, { size: 9.5 });
       y -= 6;
     }
   }
 
-  // --- Education ---
+  // ===================== EDUCATION =====================
   if ((profile.education || []).length) {
     drawHeading("Education");
     for (const edu of profile.education) {
       ensureSpace(14);
       const titleLine = [edu.title, edu.institution].filter(Boolean).join(" \u2014 ");
-      page.drawText(titleLine, { x: PAGE_MARGIN, y, size: 11, font: fontBold, color: colorDark });
+      page.drawText(titleLine, { x: PAGE_MARGIN, y, size: 11, font: fontBold, color: TEXT_DARK });
       y -= 14;
-      if (edu.period) drawParagraph(edu.period, { size: 9.5, color: colorMuted, gap: 4 });
-      for (const detail of edu.details || []) {
-        drawBullet(detail, { size: 9.5 });
-      }
+      if (edu.period) drawParagraph(edu.period, { size: 9.5, color: TEXT_MUTED, gap: 4 });
+      for (const detail of edu.details || []) drawBullet(detail, { size: 9.5 });
       y -= 6;
     }
   }
 
-  // --- Documents on file (metadata only, actual scans follow as pages) ---
+  // ===================== DOCUMENT STATUS =====================
   if ((profile.documents || []).length) {
-    drawHeading("Documents on File");
+    drawHeading("Document Status");
     for (const d of profile.documents) {
-      drawBullet(`${d.document_type || d.document_kind || "Document"} \u2014 ${d.status || "available"}`, { size: 9.5 });
+      const label = d.document_type || d.document_kind || "Document";
+      const redactionNote = d.sensitive_numbers_redacted_in_pdf ? " \u2014 numbers redacted" : "";
+      drawBullet(`${label}: ${d.status || "available"}${redactionNote}`, { size: 9.5 });
     }
+    y -= 4;
+  }
+
+  // ===================== MANUAL REVIEW NOTES =====================
+  const reviewNotes = [
+    ...(Array.isArray(profile.warnings) ? profile.warnings : []),
+    ...(Array.isArray(profile.manual_review_flags) ? profile.manual_review_flags : []),
+  ];
+  if (reviewNotes.length) {
+    drawHeading("Manual Review Notes");
+    for (const note of reviewNotes) drawBullet(note, { size: 9.5, color: rgb(0.55, 0.15, 0.1) });
   }
 
   return doc.save();
 }
 
-// ---------------------------------------------------------------------------
-// Merge N sets of single-page PDF bytes (each element of pdfByteArrays is a
-// full PDFDocument's .save() output) into one PDFDocument, in order.
-// ---------------------------------------------------------------------------
 async function mergePdfByteArrays(pdfByteArrays) {
   const finalDoc = await PDFDocument.create();
   for (const bytes of pdfByteArrays) {
@@ -422,13 +485,9 @@ async function mergePdfByteArrays(pdfByteArrays) {
 
 app.post("/merge", async (req, res) => {
   try {
-    if (!ensureAuthorized(req)) {
-      return res.status(401).json({ error: "Invalid or missing token" });
-    }
+    if (!ensureAuthorized(req)) return res.status(401).json({ error: "Invalid or missing token" });
     const documents = Array.isArray(req.body?.documents) ? req.body.documents : [];
-    if (!documents.length) {
-      return res.status(400).json({ error: "documents[] is required" });
-    }
+    if (!documents.length) return res.status(400).json({ error: "documents[] is required" });
     const finalDoc = await PDFDocument.create();
     for (const doc of documents) {
       if (!doc?.data) continue;
@@ -446,9 +505,7 @@ app.post("/merge", async (req, res) => {
       const pages = await finalDoc.copyPages(srcDoc, srcDoc.getPageIndices());
       pages.forEach((p) => finalDoc.addPage(p));
     }
-    if (finalDoc.getPageCount() === 0) {
-      return res.status(422).json({ error: "No mergeable pages produced from input documents" });
-    }
+    if (finalDoc.getPageCount() === 0) return res.status(422).json({ error: "No mergeable pages produced from input documents" });
     const mergedBytes = await finalDoc.save();
     res.setHeader("Content-Type", "application/pdf");
     res.send(Buffer.from(mergedBytes));
@@ -461,25 +518,24 @@ app.post("/merge", async (req, res) => {
 app.post("/profile-pdf", async (req, res) => {
   const requestId = (req.body?.request_id && String(req.body.request_id)) || createRequestId();
   try {
-    if (!ensureAuthorized(req)) {
-      return res.status(401).json({ error: "Invalid or missing token" });
-    }
+    if (!ensureAuthorized(req)) return res.status(401).json({ error: "Invalid or missing token" });
 
     const pdfLanguage = (req.body?.profile?.pdfLanguage || "en").toLowerCase();
     const profile = pdfLanguage === "de" ? req.body?.profile?.profile_de : req.body?.profile?.profile_en;
-    if (!profile) {
-      return res.status(400).json({ error: `profile.profile_${pdfLanguage} is required` });
-    }
+    if (!profile) return res.status(400).json({ error: `profile.profile_${pdfLanguage} is required` });
 
     const documents = Array.isArray(req.body?.documents) ? req.body.documents : [];
+    const candidatePhoto = req.body?.candidatePhoto || null;
 
     logWithRequestId(requestId, "Rendering profile page", {
       displayName: profile.display_name,
       pdfLanguage,
       documentCount: documents.length,
+      hasCandidatePhoto: Boolean(candidatePhoto),
     });
 
-    const profilePdfBytes = await renderProfilePdf(profile);
+    const candidatePhotoPngBuffer = await resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId);
+    const profilePdfBytes = await renderProfilePdf(profile, candidatePhotoPngBuffer);
     const pdfByteArrays = [profilePdfBytes];
 
     for (const doc of documents) {
@@ -493,7 +549,7 @@ app.post("/profile-pdf", async (req, res) => {
     }
 
     const mergedBytes = await mergePdfByteArrays(pdfByteArrays);
-    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} source blob(s) merged`);
+    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} blob(s) merged`);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="${req.body?.output?.fileName || "profile.pdf"}"`);
@@ -507,20 +563,14 @@ app.post("/profile-pdf", async (req, res) => {
 app.post("/publish-image", async (req, res) => {
   const requestId = createRequestId();
   try {
-    if (!ensureAuthorized(req)) {
-      return res.status(401).json({ error: "Invalid or missing token" });
-    }
+    if (!ensureAuthorized(req)) return res.status(401).json({ error: "Invalid or missing token" });
     const role = (req.body?.role || "image").toString();
     const providedMimeType = (req.body?.mimeType || "image/png").toString().toLowerCase();
     const data = req.body?.data;
-    if (!data || !isImageMime(providedMimeType)) {
-      return res.status(400).json({ error: "A supported image mimeType and base64 data are required" });
-    }
+    if (!data || !isImageMime(providedMimeType)) return res.status(400).json({ error: "A supported image mimeType and base64 data are required" });
     const decoded = decodeBase64ToBuffer(data, "publish-image data");
     const effectiveMimeType = decoded.mimeTypeFromDataUri || providedMimeType;
-    if (!isImageMime(effectiveMimeType)) {
-      return res.status(400).json({ error: `Unsupported image mimeType "${effectiveMimeType}"` });
-    }
+    if (!isImageMime(effectiveMimeType)) return res.status(400).json({ error: `Unsupported image mimeType "${effectiveMimeType}"` });
     logWithRequestId(requestId, "Publishing temporary image", {
       role,
       fileName: req.body?.fileName || null,
@@ -541,13 +591,7 @@ app.post("/publish-image", async (req, res) => {
       publicUrl: `${publicBaseUrl}/temp-images/${fileName}`,
       outputBytes: normalizedBuffer.length,
     });
-    res.json({
-      ok: true,
-      role,
-      tempImageId,
-      mimeType: "image/png",
-      publicUrl: `${publicBaseUrl}/temp-images/${fileName}`,
-    });
+    res.json({ ok: true, role, tempImageId, mimeType: "image/png", publicUrl: `${publicBaseUrl}/temp-images/${fileName}` });
   } catch (err) {
     console.error(`[${requestId}] Image publish failed`, err);
     res.status(500).json({ error: "Image publish failed", details: String(err?.message || err) });
@@ -557,9 +601,7 @@ app.post("/publish-image", async (req, res) => {
 app.get("/temp-images/:fileName", (req, res) => {
   const fileName = path.basename(req.params.fileName || "");
   const filePath = path.join(TEMP_IMAGE_DIR, fileName);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "Image not found" });
-  }
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Image not found" });
   res.setHeader("Content-Type", "image/png");
   res.setHeader("Cache-Control", "public, max-age=300");
   res.sendFile(filePath);
@@ -567,13 +609,9 @@ app.get("/temp-images/:fileName", (req, res) => {
 
 app.delete("/publish-image/:tempImageId", (req, res) => {
   try {
-    if (!ensureAuthorized(req)) {
-      return res.status(401).json({ error: "Invalid or missing token" });
-    }
+    if (!ensureAuthorized(req)) return res.status(401).json({ error: "Invalid or missing token" });
     const tempImageId = path.basename(req.params.tempImageId || "");
-    if (!tempImageId) {
-      return res.status(400).json({ error: "tempImageId is required" });
-    }
+    if (!tempImageId) return res.status(400).json({ error: "tempImageId is required" });
     const filePath = path.join(TEMP_IMAGE_DIR, `${tempImageId}.png`);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     res.json({ ok: true, tempImageId });
