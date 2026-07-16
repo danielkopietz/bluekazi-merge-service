@@ -96,7 +96,19 @@ async function normalizeImageToPngBuffer(inputBuffer) {
   const image = sharp(inputBuffer, { failOnError: true, animated: false });
   const metadata = await image.metadata();
   if (!metadata?.width || !metadata?.height) throw new Error("Image metadata is incomplete");
+  // .rotate() with no args only auto-corrects based on EXIF orientation metadata.
+  // That's a separate concern from the explicit, Vision-detected rotationCorrection
+  // (0/90/180/270) coming from n8n WF-04 — see applyRotationCorrection() below.
   return image.rotate().png().toBuffer();
+}
+
+// NEU: explizite Rotationskorrektur (0/90/180/270 im Uhrzeigersinn), gespeist aus
+// fields.rotation_correction, das WF-04 (OpenAI Vision) pro Dokument bestimmt hat.
+// Greift zusätzlich zur EXIF-Auto-Rotation oben, für Fälle ohne (verlässliche) EXIF-Daten.
+async function applyRotationCorrection(pngBuffer, rotationDegrees) {
+  const degrees = Number(rotationDegrees);
+  if (![90, 180, 270].includes(degrees)) return pngBuffer;
+  return sharp(pngBuffer).rotate(degrees).png().toBuffer();
 }
 
 function getPublicBaseUrl(req) {
@@ -156,9 +168,22 @@ async function rasterizePdfToPngBuffers(pdfBuffer, requestId) {
 async function loadDocumentPageImages(doc, requestId) {
   const label = doc.fileName || doc.name || "source document";
   const { buffer } = decodeBase64ToBuffer(doc.data, label);
-  if (isPdfMime(doc.mimeType)) return rasterizePdfToPngBuffers(buffer, requestId);
-  if (isImageMime(doc.mimeType)) return [await normalizeImageToPngBuffer(buffer)];
-  return [];
+
+  let pages;
+  if (isPdfMime(doc.mimeType)) pages = await rasterizePdfToPngBuffers(buffer, requestId);
+  else if (isImageMime(doc.mimeType)) pages = [await normalizeImageToPngBuffer(buffer)];
+  else return [];
+
+  // NEU: rotationCorrection kommt aus WF-04 (fields.rotation_correction), pro Dokument.
+  // Wird auf alle Seiten dieses Dokuments angewendet (bei PDFs i.d.R. 1 Dokument = 1 Foto/Scan,
+  // bei Mehrseiten-PDFs greift das gleichmäßig auf jede Seite — reicht für den aktuellen Anwendungsfall).
+  const rotationDegrees = Number(doc.rotationCorrection ?? doc.rotation_correction ?? 0);
+  if ([90, 180, 270].includes(rotationDegrees)) {
+    pages = await Promise.all(pages.map((pageBuffer) => applyRotationCorrection(pageBuffer, rotationDegrees)));
+    logWithRequestId(requestId, `Applied ${rotationDegrees}\u00b0 rotation correction to "${label}"`);
+  }
+
+  return pages;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +258,9 @@ async function resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId)
   try {
     if (candidatePhoto.mode === "standalone" && candidatePhoto.data) {
       const { buffer } = decodeBase64ToBuffer(candidatePhoto.data, "candidatePhoto");
-      return await normalizeImageToPngBuffer(buffer);
+      const normalized = await normalizeImageToPngBuffer(buffer);
+      // NEU: rotationCorrection auch für standalone Kandidatenfotos anwenden
+      return await applyRotationCorrection(normalized, candidatePhoto.rotationCorrection);
     }
     if (candidatePhoto.mode === "crop" && candidatePhoto.sourceDriveFileId && candidatePhoto.cropBox) {
       const sourceDoc = (documents || []).find((d) => d.driveFileId === candidatePhoto.sourceDriveFileId);
