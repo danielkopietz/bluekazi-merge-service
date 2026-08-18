@@ -8,8 +8,8 @@
 // 2) POST /profile-pdf — renders a full branded candidate profile:
 //      [branded cover + profile pages] + [document 1 pages] + [document 2 pages] + ...
 //    - Cover page: Bluekazi logo, candidate photo (if available), core fields
-//    - Profile pages: headline, highlights, experience, education, skills,
-//      document status, manual review notes
+//    - Profile pages: headline, Freshsales cf_summery, experience, education and skills
+//    - No document-status or manual-review-note sections in the profile pages
 //    - Source documents: rasterized page-by-page, with targeted black-box
 //      redactions applied at coordinates n8n already computed via Vision
 //
@@ -444,17 +444,26 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBu
     drawParagraph(profile.headline, { size: 11.5, font: fontItalic, color: TEXT_MUTED, gap: 10 });
   }
 
-  // ===================== HIGHLIGHTS =====================
-  const topFacts = (profile.top_facts || []).filter((f) => f?.public_visible !== false || f?.logged_in_visible !== false);
-  if (topFacts.length) {
-    drawHeading("Highlights");
-    for (const fact of topFacts) drawBullet(`${fact.label}: ${fact.value}`);
-    y -= 4;
+  // ===================== CRM SUMMARY =====================
+  // This text comes from Freshsales contact.custom_field.cf_summery and is
+  // deliberately rendered verbatim. It replaces the former Highlights block.
+  const crmSummary = String(profile.crm_summary || profile.summary || "").trim();
+  if (crmSummary) {
+    const summaryHeading = String(profile.language || "").toLowerCase() === "de" ? "Zusammenfassung" : "Summary";
+    drawHeading(summaryHeading);
+    const summaryParagraphs = crmSummary.split(/\n{2,}/).map((entry) => entry.trim()).filter(Boolean);
+    for (const paragraph of summaryParagraphs) drawParagraph(paragraph);
   }
 
-  // ===================== SECTIONS (summary, languages, etc.) =====================
+  // ===================== SECTIONS =====================
+  // Avoid duplicate summaries and suppress status/review sections even if an
+  // older workflow payload still contains them.
+  const excludedSectionPattern = /summary|highlight|document\s*status|manual\s*review|review\s*notes/i;
   for (const section of profile.sections || []) {
-    drawHeading(section.title || "");
+    const sectionIdentity = String(section?.key || "") + " " + String(section?.title || "");
+    if (excludedSectionPattern.test(sectionIdentity)) continue;
+    if (!section?.title) continue;
+    drawHeading(section.title);
     for (const para of section.paragraphs || []) drawParagraph(para);
     for (const bullet of section.bullets || []) drawBullet(bullet);
   }
@@ -488,26 +497,6 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBu
     }
   }
 
-  // ===================== DOCUMENT STATUS =====================
-  if ((profile.documents || []).length) {
-    drawHeading("Document Status");
-    for (const d of profile.documents) {
-      const label = d.document_type || d.document_kind || "Document";
-      const redactionNote = d.sensitive_numbers_redacted_in_pdf ? " \u2014 numbers redacted" : "";
-      drawBullet(`${label}: ${d.status || "available"}${redactionNote}`, { size: 9.5 });
-    }
-    y -= 4;
-  }
-
-  // ===================== MANUAL REVIEW NOTES =====================
-  const reviewNotes = [
-    ...(Array.isArray(profile.warnings) ? profile.warnings : []),
-    ...(Array.isArray(profile.manual_review_flags) ? profile.manual_review_flags : []),
-  ];
-  if (reviewNotes.length) {
-    drawHeading("Manual Review Notes");
-    for (const note of reviewNotes) drawBullet(note, { size: 9.5, color: rgb(0.55, 0.15, 0.1) });
-  }
 
   return doc.save();
 }
