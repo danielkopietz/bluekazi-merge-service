@@ -1,8 +1,8 @@
 {
   "name": "bluekazi-profile-merge-service",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "private": true,
-  "description": "Builds the final Bluekazi candidate PDF after BK signed, using Freshsales cf_summery and omitting internal review sections.",
+  "description": "Builds compact final Bluekazi candidate PDFs after BK signed, with cf_summery, profile-photo placement and source-page JPEG compression.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

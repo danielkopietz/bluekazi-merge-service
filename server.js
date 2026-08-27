@@ -43,6 +43,10 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.PROFILE_REND
 const TEMP_IMAGE_DIR = process.env.TEMP_IMAGE_DIR || path.join("/tmp", "bluekazi-profile-renderer-images");
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 25 * 1024 * 1024);
 const RASTER_DPI = Number(process.env.PDF_RASTER_DPI || 150);
+const COMPRESS_SOURCE_PAGES = String(process.env.COMPRESS_SOURCE_PAGES || "true").toLowerCase() !== "false";
+const SOURCE_PAGE_JPEG_QUALITY = Math.max(60, Math.min(95, Number(process.env.SOURCE_PAGE_JPEG_QUALITY || 82)));
+const SOURCE_PAGE_MAX_WIDTH = Math.max(1000, Number(process.env.SOURCE_PAGE_MAX_WIDTH || 1800));
+const SOURCE_PAGE_MAX_HEIGHT = Math.max(1400, Number(process.env.SOURCE_PAGE_MAX_HEIGHT || 2400));
 
 fs.mkdirSync(TEMP_IMAGE_DIR, { recursive: true });
 
@@ -126,18 +130,63 @@ const BRAND_NAVY_DARK = rgb(0.06, 0.14, 0.32);
 const TEXT_DARK = rgb(0.13, 0.13, 0.15);
 const TEXT_MUTED = rgb(0.4, 0.4, 0.43);
 
-async function imageBufferToPdfBytes(pngBuffer) {
+async function imageBufferToPdfBytes(imageBuffer, mimeType = "image/png") {
   const doc = await PDFDocument.create();
-  const png = await doc.embedPng(pngBuffer);
-  const { width, height } = png;
+  const image = /jpe?g/i.test(mimeType)
+    ? await doc.embedJpg(imageBuffer)
+    : await doc.embedPng(imageBuffer);
+  const { width, height } = image;
   const maxW = A4_W - PAGE_MARGIN * 2;
   const maxH = A4_H - PAGE_MARGIN * 2;
   const scale = Math.min(maxW / width, maxH / height, 1);
   const drawW = width * scale;
   const drawH = height * scale;
   const page = doc.addPage([A4_W, A4_H]);
-  page.drawImage(png, { x: (A4_W - drawW) / 2, y: (A4_H - drawH) / 2, width: drawW, height: drawH });
+  page.drawImage(image, { x: (A4_W - drawW) / 2, y: (A4_H - drawH) / 2, width: drawW, height: drawH });
   return doc.save();
+}
+
+async function compressSourcePageForPdf(pngBuffer, requestId, label) {
+  if (!COMPRESS_SOURCE_PAGES) return { buffer: pngBuffer, mimeType: "image/png" };
+
+  const inputBytes = pngBuffer.length;
+  const pipeline = sharp(pngBuffer)
+    .rotate()
+    .resize({
+      width: SOURCE_PAGE_MAX_WIDTH,
+      height: SOURCE_PAGE_MAX_HEIGHT,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .flatten({ background: "#ffffff" });
+
+  const compressed = await pipeline
+    .jpeg({
+      quality: SOURCE_PAGE_JPEG_QUALITY,
+      mozjpeg: true,
+      progressive: true,
+      chromaSubsampling: "4:4:4",
+    })
+    .toBuffer();
+
+  // Flat text/vector-style pages can already be extremely small as PNG. In
+  // that case JPEG would increase the final PDF, so keep the smaller source.
+  if (compressed.length >= inputBytes) {
+    logWithRequestId(requestId, `Kept source page "${label}" as PNG because it is already smaller`, {
+      pngBytes: inputBytes,
+      jpegBytes: compressed.length,
+    });
+    return { buffer: pngBuffer, mimeType: "image/png" };
+  }
+
+  logWithRequestId(requestId, `Compressed source page "${label}"`, {
+    inputBytes,
+    outputBytes: compressed.length,
+    reductionPercent: inputBytes ? Math.round((1 - compressed.length / inputBytes) * 100) : 0,
+    quality: SOURCE_PAGE_JPEG_QUALITY,
+  });
+
+  return { buffer: compressed, mimeType: "image/jpeg" };
 }
 
 // ---------------------------------------------------------------------------
@@ -243,53 +292,113 @@ async function documentToRedactedPdfPages(doc, requestId) {
     const pageNum = i + 1;
     const boxes = boxesByPage.get(pageNum) || [];
     const redacted = await applyRedactionBoxes(pageImages[i], boxes);
-    pdfPageBytesList.push(await imageBufferToPdfBytes(redacted));
+    const compressedPage = await compressSourcePageForPdf(redacted, requestId, `${doc.fileName || doc.name || "document"} page ${pageNum}`);
+    pdfPageBytesList.push(await imageBufferToPdfBytes(compressedPage.buffer, compressedPage.mimeType));
   }
   return pdfPageBytesList;
 }
 
 // ---------------------------------------------------------------------------
-// Candidate photo resolution: either a standalone provided photo, or a crop
-// out of one of the source documents' pages (e.g. a headshot embedded in the
-// CV), using the same fraction-coordinate convention as redaction boxes.
+// Candidate photo resolution: either an explicitly provided standalone photo,
+// a crop out of a source document, or (as a robust fallback) a source document
+// classified as candidate_photo. WF06 currently sends candidate photos inside
+// documents[] with documentHints, so the fallback keeps the cover independent
+// of an optional top-level candidatePhoto object.
 // ---------------------------------------------------------------------------
+function documentHintValues(doc) {
+  const hints = Array.isArray(doc?.documentHints)
+    ? doc.documentHints
+    : Array.isArray(doc?.hints)
+      ? doc.hints
+      : [];
+
+  const values = [
+    doc?.documentType,
+    doc?.document_type,
+    doc?.documentKind,
+    doc?.document_kind,
+    doc?.guessedDocumentType,
+    ...hints.flatMap((hint) => [
+      hint?.documentType,
+      hint?.document_type,
+      hint?.documentKind,
+      hint?.document_kind,
+      hint?.guessedDocumentType,
+    ]),
+  ];
+
+  return values.filter(Boolean).map((value) => String(value).toLowerCase());
+}
+
+function isCandidatePhotoDocument(doc) {
+  if (!doc?.data) return false;
+  const typeText = documentHintValues(doc).join(" ");
+  const fileName = String(doc.fileName || doc.name || "").toLowerCase();
+  const mimeType = String(doc.mimeType || "").toLowerCase();
+
+  const explicitlyCandidatePhoto = /candidate[_ -]?photo|profile[_ -]?photo|headshot|portrait|selfie/.test(typeText);
+  const candidatePhotoFileName = /(^|[._ -])(candidate|profile)?[._ -]?(photo|pic|picture|portrait|headshot|selfie|passbild|bewerbungsfoto)([._ -]|$)/i.test(fileName);
+  const supportedVisual = isImageMime(mimeType) || isPdfMime(mimeType);
+
+  return supportedVisual && (explicitlyCandidatePhoto || candidatePhotoFileName);
+}
+
+async function resolveCandidatePhotoFromDocuments(documents, requestId) {
+  const photoDocument = (documents || []).find(isCandidatePhotoDocument);
+  if (!photoDocument) return null;
+
+  const pages = await loadDocumentPageImages(photoDocument, requestId);
+  if (!pages[0]) return null;
+
+  logWithRequestId(requestId, `Using candidate photo source document "${photoDocument.fileName || photoDocument.name || "unnamed"}" for cover page`);
+  return pages[0];
+}
+
 async function resolveCandidatePhotoBuffer(candidatePhoto, documents, requestId) {
-  if (!candidatePhoto) return null;
-  try {
-    if (candidatePhoto.mode === "standalone" && candidatePhoto.data) {
-      const { buffer } = decodeBase64ToBuffer(candidatePhoto.data, "candidatePhoto");
-      const normalized = await normalizeImageToPngBuffer(buffer);
-      // NEU: rotationCorrection auch für standalone Kandidatenfotos anwenden
-      return await applyRotationCorrection(normalized, candidatePhoto.rotationCorrection);
-    }
-    if (candidatePhoto.mode === "crop" && candidatePhoto.sourceDriveFileId && candidatePhoto.cropBox) {
-      const sourceDoc = (documents || []).find((d) => d.driveFileId === candidatePhoto.sourceDriveFileId);
-      if (!sourceDoc) {
-        logWithRequestId(requestId, `candidatePhoto.sourceDriveFileId "${candidatePhoto.sourceDriveFileId}" not found in documents[]`);
-        return null;
+  if (candidatePhoto) {
+    try {
+      if (candidatePhoto.mode === "standalone" && candidatePhoto.data) {
+        const { buffer } = decodeBase64ToBuffer(candidatePhoto.data, "candidatePhoto");
+        const normalized = await normalizeImageToPngBuffer(buffer);
+        return await applyRotationCorrection(normalized, candidatePhoto.rotationCorrection);
       }
-      const pageImages = await loadDocumentPageImages(sourceDoc, requestId);
-      const pageIndex = Math.max(0, (candidatePhoto.cropBox.page || 1) - 1);
-      const pageImage = pageImages[pageIndex];
-      if (!pageImage) return null;
-      const meta = await sharp(pageImage).metadata();
-      const w = meta.width || 0;
-      const h = meta.height || 0;
-      if (!w || !h) return null;
-      const bx = Math.max(0, Math.min(1, candidatePhoto.cropBox.x || 0));
-      const by = Math.max(0, Math.min(1, candidatePhoto.cropBox.y || 0));
-      const bw = Math.max(0.01, Math.min(1 - bx, candidatePhoto.cropBox.width || 0));
-      const bh = Math.max(0.01, Math.min(1 - by, candidatePhoto.cropBox.height || 0));
-      const left = Math.round(bx * w);
-      const top = Math.round(by * h);
-      const width = Math.max(1, Math.round(bw * w));
-      const height = Math.max(1, Math.round(bh * h));
-      return await sharp(pageImage).extract({ left, top, width, height }).png().toBuffer();
+      if (candidatePhoto.mode === "crop" && candidatePhoto.sourceDriveFileId && candidatePhoto.cropBox) {
+        const sourceDoc = (documents || []).find((d) => d.driveFileId === candidatePhoto.sourceDriveFileId);
+        if (!sourceDoc) {
+          logWithRequestId(requestId, `candidatePhoto.sourceDriveFileId "${candidatePhoto.sourceDriveFileId}" not found in documents[]`);
+        } else {
+          const pageImages = await loadDocumentPageImages(sourceDoc, requestId);
+          const pageIndex = Math.max(0, (candidatePhoto.cropBox.page || 1) - 1);
+          const pageImage = pageImages[pageIndex];
+          if (pageImage) {
+            const meta = await sharp(pageImage).metadata();
+            const w = meta.width || 0;
+            const h = meta.height || 0;
+            if (w && h) {
+              const bx = Math.max(0, Math.min(1, candidatePhoto.cropBox.x || 0));
+              const by = Math.max(0, Math.min(1, candidatePhoto.cropBox.y || 0));
+              const bw = Math.max(0.01, Math.min(1 - bx, candidatePhoto.cropBox.width || 0));
+              const bh = Math.max(0.01, Math.min(1 - by, candidatePhoto.cropBox.height || 0));
+              const left = Math.round(bx * w);
+              const top = Math.round(by * h);
+              const width = Math.max(1, Math.round(bw * w));
+              const height = Math.max(1, Math.round(bh * h));
+              return await sharp(pageImage).extract({ left, top, width, height }).png().toBuffer();
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logWithRequestId(requestId, "Explicit candidate photo resolution failed; trying documents[] fallback", String(err?.message || err));
     }
-  } catch (err) {
-    logWithRequestId(requestId, "Candidate photo resolution failed, continuing without photo", String(err?.message || err));
   }
-  return null;
+
+  try {
+    return await resolveCandidatePhotoFromDocuments(documents, requestId);
+  } catch (err) {
+    logWithRequestId(requestId, "Candidate photo document fallback failed, continuing without photo", String(err?.message || err));
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +434,14 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBu
   let candidatePhotoImage = null;
   if (candidatePhotoPngBuffer) {
     try {
-      candidatePhotoImage = await doc.embedPng(candidatePhotoPngBuffer);
+      // Produce a consistent portrait crop for the first page. Attention-based
+      // cropping keeps the face/subject visible even for full-body photos.
+      const candidatePhotoThumbnail = await sharp(candidatePhotoPngBuffer)
+        .rotate()
+        .resize(96, 120, { fit: "cover", position: sharp.strategy.attention })
+        .png()
+        .toBuffer();
+      candidatePhotoImage = await doc.embedPng(candidatePhotoThumbnail);
     } catch (e) {
       candidatePhotoImage = null;
     }
@@ -414,10 +530,15 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBu
     }
   }
   if (candidatePhotoImage || idPreviewImage) {
-    const thumbH = 110;
-    const idThumbW = 170;
+    const thumbH = 120;
+    const idThumbW = 190;
+    const photoThumbW = 96;
+    const thumbGap = 18;
     ensureSpace(thumbH + 10);
-    let cursorX = PAGE_MARGIN;
+    const totalThumbWidth = (idPreviewImage ? idThumbW : 0)
+      + (candidatePhotoImage ? photoThumbW : 0)
+      + (idPreviewImage && candidatePhotoImage ? thumbGap : 0);
+    let cursorX = PAGE_MARGIN + Math.max(0, (maxWidth - totalThumbWidth) / 2);
     if (idPreviewImage) {
       const iw = idPreviewImage.width;
       const ih = idPreviewImage.height;
@@ -426,16 +547,11 @@ async function renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBu
       const drawH = ih * scale;
       page.drawRectangle({ x: cursorX, y: y - thumbH, width: idThumbW, height: thumbH, borderColor: BRAND_NAVY, borderWidth: 1, color: rgb(0.97, 0.97, 0.98) });
       page.drawImage(idPreviewImage, { x: cursorX + (idThumbW - drawW) / 2, y: y - thumbH + (thumbH - drawH) / 2, width: drawW, height: drawH });
-      cursorX += idThumbW + 16;
+      cursorX += idThumbW + thumbGap;
     }
     if (candidatePhotoImage) {
-      const cw = candidatePhotoImage.width;
-      const ch = candidatePhotoImage.height;
-      const scale = Math.min(thumbH / cw, thumbH / ch);
-      const drawW = cw * scale;
-      const drawH = ch * scale;
-      page.drawRectangle({ x: cursorX, y: y - thumbH, width: thumbH, height: thumbH, borderColor: BRAND_NAVY, borderWidth: 1, color: rgb(0.97, 0.97, 0.98) });
-      page.drawImage(candidatePhotoImage, { x: cursorX + (thumbH - drawW) / 2, y: y - thumbH + (thumbH - drawH) / 2, width: drawW, height: drawH });
+      page.drawRectangle({ x: cursorX, y: y - thumbH, width: photoThumbW, height: thumbH, borderColor: BRAND_NAVY, borderWidth: 1, color: rgb(0.97, 0.97, 0.98) });
+      page.drawImage(candidatePhotoImage, { x: cursorX, y: y - thumbH, width: photoThumbW, height: thumbH });
     }
     y -= thumbH + 14;
   }
