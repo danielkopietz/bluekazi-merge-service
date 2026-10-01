@@ -1,8 +1,8 @@
 {
   "name": "bluekazi-profile-merge-service",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
-  "description": "Builds compact final Bluekazi candidate PDFs after BK signed, with cf_summery, profile-photo placement and source-page JPEG compression.",
+  "description": "Builds email-ready Bluekazi candidate PDFs with adaptive source-page compression and a final Ghostscript size guard.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

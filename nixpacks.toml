@@ -1,2 +1,2 @@
 [phases.setup]
-aptPkgs = ["poppler-utils"]
+aptPkgs = ["poppler-utils", "ghostscript"]

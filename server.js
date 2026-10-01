@@ -38,15 +38,19 @@ const execFileAsync = promisify(execFile);
 const app = express();
 app.use(express.json({ limit: "80mb" }));
 
+const SERVICE_VERSION = "1.4.0";
 const SHARED_TOKEN = process.env.MERGE_SERVICE_TOKEN || "";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.PROFILE_RENDERER_BASE_URL || "").replace(/\/+$/, "");
 const TEMP_IMAGE_DIR = process.env.TEMP_IMAGE_DIR || path.join("/tmp", "bluekazi-profile-renderer-images");
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 25 * 1024 * 1024);
 const RASTER_DPI = Number(process.env.PDF_RASTER_DPI || 150);
 const COMPRESS_SOURCE_PAGES = String(process.env.COMPRESS_SOURCE_PAGES || "true").toLowerCase() !== "false";
-const SOURCE_PAGE_JPEG_QUALITY = Math.max(60, Math.min(95, Number(process.env.SOURCE_PAGE_JPEG_QUALITY || 82)));
-const SOURCE_PAGE_MAX_WIDTH = Math.max(1000, Number(process.env.SOURCE_PAGE_MAX_WIDTH || 1800));
-const SOURCE_PAGE_MAX_HEIGHT = Math.max(1400, Number(process.env.SOURCE_PAGE_MAX_HEIGHT || 2400));
+const SOURCE_PAGE_JPEG_QUALITY = Math.max(50, Math.min(90, Number(process.env.SOURCE_PAGE_JPEG_QUALITY || 72)));
+const SOURCE_PAGE_MAX_WIDTH = Math.max(1000, Number(process.env.SOURCE_PAGE_MAX_WIDTH || 1500));
+const SOURCE_PAGE_MAX_HEIGHT = Math.max(1400, Number(process.env.SOURCE_PAGE_MAX_HEIGHT || 2100));
+const SOURCE_PAGE_TARGET_BYTES = Math.max(140 * 1024, Number(process.env.SOURCE_PAGE_TARGET_BYTES || 360 * 1024));
+const FINAL_PDF_TARGET_BYTES = Math.max(2 * 1024 * 1024, Number(process.env.FINAL_PDF_TARGET_BYTES || 8 * 1024 * 1024));
+const FINAL_PDF_HARD_LIMIT_BYTES = Math.max(FINAL_PDF_TARGET_BYTES, Number(process.env.FINAL_PDF_HARD_LIMIT_BYTES || 10 * 1024 * 1024));
 
 fs.mkdirSync(TEMP_IMAGE_DIR, { recursive: true });
 
@@ -150,43 +154,40 @@ async function compressSourcePageForPdf(pngBuffer, requestId, label) {
   if (!COMPRESS_SOURCE_PAGES) return { buffer: pngBuffer, mimeType: "image/png" };
 
   const inputBytes = pngBuffer.length;
-  const pipeline = sharp(pngBuffer)
-    .rotate()
-    .resize({
-      width: SOURCE_PAGE_MAX_WIDTH,
-      height: SOURCE_PAGE_MAX_HEIGHT,
-      fit: "inside",
-      withoutEnlargement: true,
-    })
-    .flatten({ background: "#ffffff" });
+  const attempts = [
+    { width: SOURCE_PAGE_MAX_WIDTH, height: SOURCE_PAGE_MAX_HEIGHT, quality: SOURCE_PAGE_JPEG_QUALITY },
+    { width: Math.max(1150, Math.round(SOURCE_PAGE_MAX_WIDTH * 0.84)), height: Math.max(1600, Math.round(SOURCE_PAGE_MAX_HEIGHT * 0.84)), quality: Math.max(58, SOURCE_PAGE_JPEG_QUALITY - 10) },
+    { width: 1100, height: 1550, quality: 52 },
+  ];
 
-  const compressed = await pipeline
-    .jpeg({
-      quality: SOURCE_PAGE_JPEG_QUALITY,
-      mozjpeg: true,
-      progressive: true,
-      chromaSubsampling: "4:4:4",
-    })
-    .toBuffer();
-
-  // Flat text/vector-style pages can already be extremely small as PNG. In
-  // that case JPEG would increase the final PDF, so keep the smaller source.
-  if (compressed.length >= inputBytes) {
-    logWithRequestId(requestId, `Kept source page "${label}" as PNG because it is already smaller`, {
-      pngBytes: inputBytes,
-      jpegBytes: compressed.length,
-    });
-    return { buffer: pngBuffer, mimeType: "image/png" };
+  let smallest = { buffer: pngBuffer, mimeType: "image/png", width: null, height: null, quality: null };
+  for (const attempt of attempts) {
+    const candidate = await sharp(pngBuffer)
+      .rotate()
+      .resize({ width: attempt.width, height: attempt.height, fit: "inside", withoutEnlargement: true })
+      .flatten({ background: "#ffffff" })
+      .jpeg({
+        quality: attempt.quality,
+        mozjpeg: true,
+        progressive: true,
+        chromaSubsampling: "4:2:0",
+      })
+      .toBuffer();
+    if (candidate.length < smallest.buffer.length) {
+      smallest = { buffer: candidate, mimeType: "image/jpeg", ...attempt };
+    }
+    if (candidate.length <= SOURCE_PAGE_TARGET_BYTES) break;
   }
 
   logWithRequestId(requestId, `Compressed source page "${label}"`, {
     inputBytes,
-    outputBytes: compressed.length,
-    reductionPercent: inputBytes ? Math.round((1 - compressed.length / inputBytes) * 100) : 0,
-    quality: SOURCE_PAGE_JPEG_QUALITY,
+    outputBytes: smallest.buffer.length,
+    reductionPercent: inputBytes ? Math.round((1 - smallest.buffer.length / inputBytes) * 100) : 0,
+    quality: smallest.quality,
+    targetBytes: SOURCE_PAGE_TARGET_BYTES,
   });
 
-  return { buffer: compressed, mimeType: "image/jpeg" };
+  return { buffer: smallest.buffer, mimeType: smallest.mimeType };
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +628,73 @@ async function mergePdfByteArrays(pdfByteArrays) {
   return finalDoc.save();
 }
 
+async function ghostscriptCompress(pdfBuffer, requestId, mode) {
+  const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "bluekazi-compress-"));
+  const inputPath = path.join(workDir, "input.pdf");
+  const outputPath = path.join(workDir, "output.pdf");
+  const profile = mode === "ultra"
+    ? { resolution: 80, jpegQuality: 40 }
+    : mode === "strong"
+      ? { resolution: 96, jpegQuality: 48 }
+      : { resolution: 120, jpegQuality: 64 };
+  const { resolution, jpegQuality } = profile;
+  try {
+    await fs.promises.writeFile(inputPath, pdfBuffer);
+    await execFileAsync("gs", [
+      "-sDEVICE=pdfwrite",
+      "-dCompatibilityLevel=1.4",
+      "-dNOPAUSE",
+      "-dQUIET",
+      "-dBATCH",
+      "-dSAFER",
+      "-dDetectDuplicateImages=true",
+      "-dCompressFonts=true",
+      "-dSubsetFonts=true",
+      "-dAutoRotatePages=/None",
+      "-dColorImageDownsampleType=/Bicubic",
+      `-dColorImageResolution=${resolution}`,
+      "-dGrayImageDownsampleType=/Bicubic",
+      `-dGrayImageResolution=${resolution}`,
+      "-dMonoImageDownsampleType=/Subsample",
+      "-dMonoImageResolution=300",
+      `-dJPEGQ=${jpegQuality}`,
+      `-sOutputFile=${outputPath}`,
+      inputPath,
+    ], { maxBuffer: 20 * 1024 * 1024 });
+    const output = await fs.promises.readFile(outputPath);
+    logWithRequestId(requestId, `Ghostscript ${mode} compression finished`, {
+      inputBytes: pdfBuffer.length,
+      outputBytes: output.length,
+      resolution,
+      jpegQuality,
+    });
+    return output.length > 0 && output.length < pdfBuffer.length ? output : pdfBuffer;
+  } finally {
+    await fs.promises.rm(workDir, { recursive: true, force: true });
+  }
+}
+
+async function enforceFinalPdfSize(pdfBuffer, requestId, requestedTargetBytes) {
+  const targetBytes = Math.max(
+    2 * 1024 * 1024,
+    Math.min(FINAL_PDF_HARD_LIMIT_BYTES, Number(requestedTargetBytes || FINAL_PDF_TARGET_BYTES))
+  );
+  let output = Buffer.from(pdfBuffer);
+  if (output.length <= targetBytes) return { output, targetBytes };
+  try {
+    output = await ghostscriptCompress(output, requestId, "balanced");
+    if (output.length > targetBytes) {
+      output = await ghostscriptCompress(output, requestId, "strong");
+    }
+    if (output.length > FINAL_PDF_HARD_LIMIT_BYTES) {
+      output = await ghostscriptCompress(output, requestId, "ultra");
+    }
+  } catch (error) {
+    logWithRequestId(requestId, "Final PDF compression failed; returning the already page-compressed PDF", String(error?.message || error));
+  }
+  return { output, targetBytes };
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -759,12 +827,26 @@ app.post("/profile-pdf", async (req, res) => {
     const profilePdfBytes = await renderProfilePdf(profile, candidatePhotoPngBuffer, idPreviewPngBuffer);
     const pdfByteArrays = [profilePdfBytes, ...documentPageArrays];
 
-    const mergedBytes = await mergePdfByteArrays(pdfByteArrays);
-    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} blob(s) merged (${documentPageArrays.length} source document page(s))`);
+    const mergedBytes = Buffer.from(await mergePdfByteArrays(pdfByteArrays));
+    const compressionResult = await enforceFinalPdfSize(
+      mergedBytes,
+      requestId,
+      req.body?.output?.maxBytes || req.body?.compression?.targetBytes
+    );
+    const finalBytes = compressionResult.output;
+    logWithRequestId(requestId, `Final profile PDF built: ${pdfByteArrays.length} blob(s) merged (${documentPageArrays.length} source document page(s))`, {
+      beforeFinalCompressionBytes: mergedBytes.length,
+      finalBytes: finalBytes.length,
+      targetBytes: compressionResult.targetBytes,
+    });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="${req.body?.output?.fileName || "profile.pdf"}"`);
-    res.send(Buffer.from(mergedBytes));
+    res.setHeader("X-Bluekazi-Renderer-Version", SERVICE_VERSION);
+    res.setHeader("X-Bluekazi-PDF-Bytes-Before", String(mergedBytes.length));
+    res.setHeader("X-Bluekazi-PDF-Bytes-Final", String(finalBytes.length));
+    res.setHeader("X-Bluekazi-PDF-Target-Bytes", String(compressionResult.targetBytes));
+    res.send(finalBytes);
   } catch (err) {
     console.error(`[${requestId}]`, err);
     res.status(500).json({ error: "Profile PDF generation failed", details: String(err?.message || err) });
@@ -832,7 +914,17 @@ app.delete("/publish-image/:tempImageId", (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, tempImageDir: TEMP_IMAGE_DIR }));
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  version: SERVICE_VERSION,
+  tempImageDir: TEMP_IMAGE_DIR,
+  compression: {
+    sourcePages: COMPRESS_SOURCE_PAGES,
+    sourcePageTargetBytes: SOURCE_PAGE_TARGET_BYTES,
+    finalPdfTargetBytes: FINAL_PDF_TARGET_BYTES,
+    finalPdfHardLimitBytes: FINAL_PDF_HARD_LIMIT_BYTES,
+  },
+}));
 
 const PORT = process.env.PORT || 8088;
 app.listen(PORT, () => console.log(`Profile merge service listening on :${PORT}`));
